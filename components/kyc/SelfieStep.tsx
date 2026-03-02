@@ -1,550 +1,503 @@
 'use client'
 
 import { useRef, useState, useCallback, useEffect } from 'react'
-import { Eye, Camera, RefreshCw, Check, ArrowRight, AlertCircle, CheckCircle2, Upload } from 'lucide-react'
+import {
+  Eye, Camera, RefreshCw, Check, ArrowRight,
+  AlertCircle, CheckCircle2, Upload
+} from 'lucide-react'
 import { useKYCStore } from '@/lib/kyc-store'
 import clsx from 'clsx'
 
-type LivenessCheck = {
-  id: string
-  label: string
-  instruction: string
-  done: boolean
-}
+/* ─── Types ─────────────────────────────────────────────────────────────── */
 
-const buildChecks = (): LivenessCheck[] => [
-  { id: 'center', label: 'Centra tu rostro',       instruction: '👤 Coloca tu cara dentro del óvalo', done: false },
-  { id: 'blink',  label: 'Parpadea 2 veces',        instruction: '👁️ Parpadea lentamente 2 veces',    done: false },
-  { id: 'left',   label: 'Gira a la izquierda',     instruction: '⬅️ Gira la cabeza a la izquierda', done: false },
-  { id: 'right',  label: 'Gira a la derecha',       instruction: '➡️ Gira la cabeza a la derecha',   done: false },
-  { id: 'smile',  label: 'Sonríe',                  instruction: '😊 Sonríe naturalmente',            done: false },
+type Check = { id: string; label: string; instruction: string; done: boolean }
+type Mode  = 'guide' | 'camera' | 'preview' | 'analyzing'
+
+const makeChecks = (): Check[] => [
+  { id: 'center', label: 'Centra tu rostro',     instruction: '👤 Coloca tu cara dentro del óvalo', done: false },
+  { id: 'blink',  label: 'Parpadea 2 veces',      instruction: '👁️ Parpadea lentamente 2 veces',    done: false },
+  { id: 'left',   label: 'Gira a la izquierda',   instruction: '⬅️ Gira tu cabeza a la izquierda', done: false },
+  { id: 'right',  label: 'Gira a la derecha',     instruction: '➡️ Gira tu cabeza a la derecha',   done: false },
+  { id: 'smile',  label: 'Sonríe',                instruction: '😊 Sonríe naturalmente',            done: false },
 ]
 
-type Mode = 'guide' | 'camera' | 'preview' | 'analyzing'
+/* ─── Pixel helpers ──────────────────────────────────────────────────────── */
 
-// ── Pixel analysis helpers ────────────────────────────────────────────────────
-
-function regionBrightness(
-  data: Uint8ClampedArray,
+function brightness(
+  d: Uint8ClampedArray,
   x0: number, y0: number,
-  w: number, h: number,
+  w: number,  h: number,
   stride: number
 ): number {
-  let sum = 0, n = 0
-  const x1 = Math.min(x0 + w, stride)
-  const y1 = y0 + h
-  for (let y = y0; y < y1; y++) {
-    for (let x = x0; x < x1; x++) {
+  let s = 0, n = 0
+  for (let y = y0; y < y0 + h; y++) {
+    for (let x = x0; x < x0 + w; x++) {
       const i = (y * stride + x) * 4
-      sum += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114
+      s += d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114
       n++
     }
   }
-  return n ? sum / n : 0
+  return n ? s / n : 0
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+/* ─── Component ──────────────────────────────────────────────────────────── */
 
 export default function SelfieStep() {
   const { setStep, setSelfie, completeStep } = useKYCStore()
 
-  const [mode, setMode]             = useState<Mode>('guide')
-  const [capturedImage, setCaptured] = useState<string | null>(null)
-  const [checks, setChecks]         = useState<LivenessCheck[]>(buildChecks())
-  const [currentIdx, setCurrentIdx] = useState(0)
-  const [cameraError, setCameraError] = useState<string | null>(null)
-  const [faceInFrame, setFaceInFrame] = useState(false)
-  const [instruction, setInstruction] = useState('')
-  const [analysisProgress, setAnalysisProgress] = useState(0)
-  const [capturing, setCapturing]   = useState(false)
+  const [mode,        setMode]        = useState<Mode>('guide')
+  const [snapshot,    setSnapshot]    = useState<string | null>(null)
+  const [checks,      setChecks]      = useState<Check[]>(makeChecks())
+  const [activeIdx,   setActiveIdx]   = useState(0)
+  const [faceFound,   setFaceFound]   = useState(false)
+  const [hint,        setHint]        = useState('')
+  const [camError,    setCamError]    = useState<string | null>(null)
+  const [progress,    setProgress]    = useState(0)
+  const [done,        setDone]        = useState(false)
 
-  // Refs
-  const videoRef     = useRef<HTMLVideoElement>(null)
-  const sampleCanvas = useRef<HTMLCanvasElement>(null) // hidden — for pixel sampling
-  const overlayRef   = useRef<HTMLCanvasElement>(null) // visible — shows camera + oval
-  const streamRef    = useRef<MediaStream | null>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
-  const loopRef      = useRef<number | null>(null)
-  const drawRef      = useRef<number | null>(null)
+  /* DOM refs */
+  const videoRef   = useRef<HTMLVideoElement>(null)
+  const overlayRef = useRef<HTMLCanvasElement>(null)  // draws oval + scan line on top of video
+  const sampleRef  = useRef<HTMLCanvasElement>(null)  // offscreen — pixel analysis
+  const fileRef    = useRef<HTMLInputElement>(null)
 
-  // Mutable state refs (avoid stale closures in rAF loops)
-  const checksRef    = useRef<LivenessCheck[]>(buildChecks())
-  const idxRef       = useRef(0)
-  const faceRef      = useRef(false)
-  const capturingRef = useRef(false)
+  /* Loop refs */
+  const streamRef  = useRef<MediaStream | null>(null)
+  const drawRaf    = useRef<number>(0)
+  const analysisRaf = useRef<number>(0)
 
-  // Per-check accumulators
-  const blinkCountRef  = useRef(0)
-  const blinkBaseRef   = useRef<number | null>(null)
-  const blinkCoolRef   = useRef(0)          // cooldown frames after blink
-  const turnFramesRef  = useRef<number[]>([])
-  const smileFramesRef = useRef<number[]>([])
-  const smileBaseRef   = useRef<number | null>(null)
-  const centerFrames   = useRef(0)
+  /* Mutable check state (avoids stale closures) */
+  const checksRef   = useRef<Check[]>(makeChecks())
+  const idxRef      = useRef(0)
+  const faceRef     = useRef(false)
+  const doneRef     = useRef(false)
 
-  // ── Stop everything ───────────────────────────────────────────────────────
+  /* Blink accumulators */
+  const blinkCount  = useRef(0)
+  const blinkBase   = useRef<number | null>(null)
+  const blinkCalib  = useRef<number[]>([])
+  const blinkCool   = useRef(0)
 
-  const stopAll = useCallback(() => {
-    if (loopRef.current)  cancelAnimationFrame(loopRef.current)
-    if (drawRef.current)  cancelAnimationFrame(drawRef.current)
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop())
-      streamRef.current = null
-    }
-  }, [])
+  /* Turn accumulators */
+  const turnBuf     = useRef<number[]>([])
 
-  useEffect(() => () => stopAll(), [stopAll])
+  /* Smile accumulators */
+  const smileBase   = useRef<number | null>(null)
+  const smileCalib  = useRef<number[]>([])
 
-  // ── Reset per-check accumulators ──────────────────────────────────────────
+  /* Center accumulator */
+  const centerTick  = useRef(0)
 
-  const resetAccumulators = () => {
-    blinkCountRef.current  = 0
-    blinkBaseRef.current   = null
-    blinkCoolRef.current   = 0
-    turnFramesRef.current  = []
-    smileFramesRef.current = []
-    smileBaseRef.current   = null
-    centerFrames.current   = 0
+  /* ── Reset per-check state ─────────────────────────────────────────────── */
+  const resetAccum = () => {
+    blinkCount.current = 0; blinkBase.current = null
+    blinkCalib.current = []; blinkCool.current = 0
+    turnBuf.current = []
+    smileBase.current = null; smileCalib.current = []
+    centerTick.current = 0
   }
 
-  // ── Capture photo ─────────────────────────────────────────────────────────
+  /* ── Stop camera & loops ───────────────────────────────────────────────── */
+  const stopCamera = useCallback(() => {
+    cancelAnimationFrame(drawRaf.current)
+    cancelAnimationFrame(analysisRaf.current)
+    streamRef.current?.getTracks().forEach(t => t.stop())
+    streamRef.current = null
+  }, [])
 
+  useEffect(() => () => stopCamera(), [stopCamera])
+
+  /* ── Capture photo ─────────────────────────────────────────────────────── */
   const capturePhoto = useCallback(() => {
-    const video  = videoRef.current
-    const canvas = sampleCanvas.current
-    if (!video || !canvas || capturingRef.current) return
-    capturingRef.current = true
-    setCapturing(true)
-
-    canvas.width  = video.videoWidth  || 640
-    canvas.height = video.videoHeight || 480
-    const ctx = canvas.getContext('2d')!
-    ctx.save()
-    ctx.translate(canvas.width, 0)
-    ctx.scale(-1, 1)
-    ctx.drawImage(video, 0, 0)
-    ctx.restore()
-
-    const image = canvas.toDataURL('image/jpeg', 0.92)
-    stopAll()
-    setCaptured(image)
+    const v = videoRef.current
+    const c = sampleRef.current
+    if (!v || !c) return
+    c.width  = v.videoWidth  || 640
+    c.height = v.videoHeight || 480
+    const ctx = c.getContext('2d')!
+    // mirror (selfie)
+    ctx.save(); ctx.translate(c.width, 0); ctx.scale(-1, 1)
+    ctx.drawImage(v, 0, 0); ctx.restore()
+    const img = c.toDataURL('image/jpeg', 0.92)
+    stopCamera()
+    setSnapshot(img)
     setMode('preview')
-  }, [stopAll])
+  }, [stopCamera])
 
-  // ── Analysis loop (rAF) ───────────────────────────────────────────────────
-
-  const analysisLoop = useCallback(() => {
-    const video  = videoRef.current
-    const canvas = sampleCanvas.current
-    if (!video || !canvas || video.readyState < 2 || capturingRef.current) {
-      loopRef.current = requestAnimationFrame(analysisLoop)
-      return
-    }
-
-    const W = video.videoWidth  || 320
-    const H = video.videoHeight || 240
-    canvas.width  = W
-    canvas.height = H
-
-    const ctx = canvas.getContext('2d')!
-    // Sample original (un-mirrored) for analysis
-    ctx.drawImage(video, 0, 0)
-    const { data } = ctx.getImageData(0, 0, W, H)
-
-    // ── Face presence: centre oval brightness vs corners ──────────────────
-    const cB  = regionBrightness(data, Math.floor(W * 0.25), Math.floor(H * 0.15), Math.floor(W * 0.5), Math.floor(H * 0.7), W)
-    const tl  = regionBrightness(data, 0, 0, Math.floor(W * 0.2), Math.floor(H * 0.2), W)
-    const tr  = regionBrightness(data, Math.floor(W * 0.8), 0, Math.floor(W * 0.2), Math.floor(H * 0.2), W)
-    const bgB = (tl + tr) / 2
-    const hasFace = Math.abs(cB - bgB) > 6 && cB > 25
-
-    faceRef.current = hasFace
-    setFaceInFrame(hasFace)
-
-    const idx = idxRef.current
-    const check = checksRef.current[idx]
-
-    if (!check || capturingRef.current) {
-      loopRef.current = requestAnimationFrame(analysisLoop)
-      return
-    }
-
-    if (!hasFace) {
-      setInstruction('👤 Coloca tu cara dentro del óvalo')
-      loopRef.current = requestAnimationFrame(analysisLoop)
-      return
-    }
-
-    setInstruction(check.instruction)
-    let passed = false
-
-    // ── Per-check logic ────────────────────────────────────────────────────
-
-    if (check.id === 'center') {
-      centerFrames.current++
-      passed = centerFrames.current > 20 // hold still for ~0.7s
-    }
-
-    else if (check.id === 'blink') {
-      // Eye region: upper-middle strip
-      const eyeY = Math.floor(H * 0.25)
-      const eyeH = Math.floor(H * 0.14)
-      const eyeX = Math.floor(W * 0.2)
-      const eyeW = Math.floor(W * 0.6)
-      const eyeB = regionBrightness(data, eyeX, eyeY, eyeW, eyeH, W)
-
-      if (blinkBaseRef.current === null) {
-        // Calibrate baseline for first 25 frames
-        const arr = (blinkBaseRef as any)._arr = (blinkBaseRef as any)._arr || []
-        arr.push(eyeB)
-        if (arr.length >= 25) {
-          blinkBaseRef.current = arr.reduce((a: number, b: number) => a + b, 0) / arr.length
-          ;(blinkBaseRef as any)._arr = []
-        }
-      } else if (blinkCoolRef.current > 0) {
-        blinkCoolRef.current--
-      } else {
-        const drop = blinkBaseRef.current - eyeB
-        if (drop > 7) {
-          // Eye closed (darker)
-          blinkCountRef.current++
-          blinkCoolRef.current = 18 // ~0.6s cooldown
-          // Update baseline to current open-eye level
-          blinkBaseRef.current = null
-          ;(blinkBaseRef as any)._arr = []
-        }
-      }
-      passed = blinkCountRef.current >= 2
-    }
-
-    else if (check.id === 'left') {
-      // Left-side (from camera) brightness vs right side
-      // When user turns left, camera-right side of face becomes more exposed → brighter
-      const sideW = Math.floor(W * 0.22)
-      const sideY = Math.floor(H * 0.2)
-      const sideH = Math.floor(H * 0.55)
-      const lB = regionBrightness(data, 0, sideY, sideW, sideH, W)
-      const rB = regionBrightness(data, W - sideW, sideY, sideW, sideH, W)
-      const diff = rB - lB // positive = right brighter = head turned toward left
-
-      turnFramesRef.current.push(diff)
-      if (turnFramesRef.current.length > 12) turnFramesRef.current.shift()
-      const avg = turnFramesRef.current.reduce((a, b) => a + b, 0) / turnFramesRef.current.length
-      passed = avg > 5
-    }
-
-    else if (check.id === 'right') {
-      const sideW = Math.floor(W * 0.22)
-      const sideY = Math.floor(H * 0.2)
-      const sideH = Math.floor(H * 0.55)
-      const lB = regionBrightness(data, 0, sideY, sideW, sideH, W)
-      const rB = regionBrightness(data, W - sideW, sideY, sideW, sideH, W)
-      const diff = lB - rB // positive = left brighter = head turned right
-
-      turnFramesRef.current.push(diff)
-      if (turnFramesRef.current.length > 12) turnFramesRef.current.shift()
-      const avg = turnFramesRef.current.reduce((a, b) => a + b, 0) / turnFramesRef.current.length
-      passed = avg > 5
-    }
-
-    else if (check.id === 'smile') {
-      // Mouth region: teeth appear → brighter lower-face
-      const mY = Math.floor(H * 0.58)
-      const mH = Math.floor(H * 0.16)
-      const mX = Math.floor(W * 0.3)
-      const mW = Math.floor(W * 0.4)
-      const mB = regionBrightness(data, mX, mY, mW, mH, W)
-
-      smileFramesRef.current.push(mB)
-      if (smileFramesRef.current.length > 20) smileFramesRef.current.shift()
-
-      // Calibrate smile baseline
-      if (smileBaseRef.current === null && smileFramesRef.current.length >= 20) {
-        smileBaseRef.current = smileFramesRef.current.slice(0, 15).reduce((a, b) => a + b, 0) / 15
-      }
-
-      if (smileBaseRef.current !== null) {
-        passed = (mB - smileBaseRef.current) > 4.5
-      }
-    }
-
-    // ── Advance check on pass ──────────────────────────────────────────────
-
-    if (passed) {
-      checksRef.current = checksRef.current.map((c, i) => i === idx ? { ...c, done: true } : c)
-      setChecks([...checksRef.current])
-      idxRef.current = idx + 1
-      setCurrentIdx(idx + 1)
-      resetAccumulators()
-
-      if (idxRef.current >= checksRef.current.length) {
-        setInstruction('✅ ¡Perfecto! Tomando foto...')
-        setTimeout(() => capturePhoto(), 700)
-        loopRef.current = requestAnimationFrame(analysisLoop)
-        return
-      }
-    }
-
-    loopRef.current = requestAnimationFrame(analysisLoop)
-  }, [capturePhoto])
-
-  // ── Draw loop — mirrors camera onto visible canvas + oval overlay ──────────
-
+  /* ── Draw loop — overlay canvas on top of <video> ──────────────────────── */
   const drawLoop = useCallback(() => {
-    const video   = videoRef.current
-    const overlay = overlayRef.current
-    if (!video || !overlay || video.readyState < 2) {
-      drawRef.current = requestAnimationFrame(drawLoop)
-      return
-    }
+    const ov = overlayRef.current
+    if (!ov) { drawRaf.current = requestAnimationFrame(drawLoop); return }
 
-    const W = video.videoWidth  || 640
-    const H = video.videoHeight || 480
-    overlay.width  = W
-    overlay.height = H
+    const W = ov.offsetWidth  || 640
+    const H = ov.offsetHeight || 480
+    if (ov.width !== W)  ov.width  = W
+    if (ov.height !== H) ov.height = H
 
-    const ctx = overlay.getContext('2d')!
+    const ctx = ov.getContext('2d')!
+    ctx.clearRect(0, 0, W, H)
 
-    // Draw mirrored video
-    ctx.save()
-    ctx.translate(W, 0)
-    ctx.scale(-1, 1)
-    ctx.drawImage(video, 0, 0)
-    ctx.restore()
+    const cx = W / 2, cy = H / 2
+    const rx = W * 0.27, ry = H * 0.44
 
-    // Dark mask outside oval
-    const cx = W / 2
-    const cy = H / 2
-    const rx = W * 0.27
-    const ry = H * 0.43
-
+    /* Dark vignette outside oval */
     ctx.save()
     ctx.beginPath()
     ctx.rect(0, 0, W, H)
     ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2)
-    ctx.fillStyle = 'rgba(0,0,0,0.52)'
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'
     ctx.fill('evenodd')
     ctx.restore()
 
-    // Oval border
-    const alive = faceRef.current
+    /* Oval border */
     ctx.beginPath()
     ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2)
-    ctx.strokeStyle = alive ? '#4ade80' : '#f59e0b'
+    ctx.strokeStyle = faceRef.current ? '#4ade80' : '#f59e0b'
     ctx.lineWidth = 3
     ctx.stroke()
 
-    // Animated scan line
-    if (alive) {
-      const t = (Date.now() % 2200) / 2200
-      const sy = (cy - ry) + t * (ry * 2)
-      const g = ctx.createLinearGradient(cx - rx, 0, cx + rx, 0)
+    /* Scan line when face detected */
+    if (faceRef.current && !doneRef.current) {
+      const t  = (Date.now() % 2000) / 2000
+      const sy = (cy - ry) + t * ry * 2
+      const g  = ctx.createLinearGradient(cx - rx, 0, cx + rx, 0)
       g.addColorStop(0,   'transparent')
-      g.addColorStop(0.5, 'rgba(74,222,128,0.75)')
+      g.addColorStop(0.5, 'rgba(74,222,128,0.8)')
       g.addColorStop(1,   'transparent')
       ctx.beginPath()
-      ctx.moveTo(cx - rx, sy)
-      ctx.lineTo(cx + rx, sy)
-      ctx.strokeStyle = g
-      ctx.lineWidth = 2
-      ctx.stroke()
+      ctx.moveTo(cx - rx, sy); ctx.lineTo(cx + rx, sy)
+      ctx.strokeStyle = g; ctx.lineWidth = 2; ctx.stroke()
     }
 
-    drawRef.current = requestAnimationFrame(drawLoop)
+    drawRaf.current = requestAnimationFrame(drawLoop)
   }, [])
 
-  // ── Start camera ──────────────────────────────────────────────────────────
+  /* ── Analysis loop — reads pixels from video via offscreen canvas ───────── */
+  const analysisLoop = useCallback(() => {
+    const v = videoRef.current
+    const c = sampleRef.current
+    if (!v || !c || v.readyState < 2 || doneRef.current) {
+      analysisRaf.current = requestAnimationFrame(analysisLoop); return
+    }
 
+    const W = v.videoWidth, H = v.videoHeight
+    if (!W || !H) { analysisRaf.current = requestAnimationFrame(analysisLoop); return }
+
+    c.width = W; c.height = H
+    const ctx = c.getContext('2d')!
+    ctx.drawImage(v, 0, 0)            // NOT mirrored — raw for analysis
+    const { data } = ctx.getImageData(0, 0, W, H)
+
+    /* Face detection: centre vs top corners */
+    const cB  = brightness(data, Math.floor(W*.25), Math.floor(H*.15), Math.floor(W*.5), Math.floor(H*.65), W)
+    const tl  = brightness(data, 0, 0, Math.floor(W*.18), Math.floor(H*.18), W)
+    const tr  = brightness(data, Math.floor(W*.82), 0, Math.floor(W*.18), Math.floor(H*.18), W)
+    const bg  = (tl + tr) / 2
+    const has = cB > 20 && Math.abs(cB - bg) > 5
+
+    faceRef.current = has
+    setFaceFound(has)
+
+    const idx   = idxRef.current
+    const check = checksRef.current[idx]
+
+    if (!check) { analysisRaf.current = requestAnimationFrame(analysisLoop); return }
+
+    if (!has) {
+      setHint('👤 Coloca tu cara dentro del óvalo')
+      analysisRaf.current = requestAnimationFrame(analysisLoop); return
+    }
+
+    setHint(check.instruction)
+    let passed = false
+
+    /* center */
+    if (check.id === 'center') {
+      centerTick.current++
+      passed = centerTick.current > 25
+    }
+
+    /* blink */
+    else if (check.id === 'blink') {
+      const eY = Math.floor(H*.26), eH = Math.floor(H*.14)
+      const eX = Math.floor(W*.2),  eW = Math.floor(W*.6)
+      const eb = brightness(data, eX, eY, eW, eH, W)
+
+      if (blinkBase.current === null) {
+        blinkCalib.current.push(eb)
+        if (blinkCalib.current.length >= 30) {
+          blinkBase.current = blinkCalib.current.reduce((a,b)=>a+b,0) / blinkCalib.current.length
+          blinkCalib.current = []
+        }
+      } else if (blinkCool.current > 0) {
+        blinkCool.current--
+      } else {
+        if ((blinkBase.current - eb) > 8) {
+          blinkCount.current++
+          blinkCool.current = 20
+          blinkBase.current = null; blinkCalib.current = []
+        }
+      }
+      passed = blinkCount.current >= 2
+    }
+
+    /* turn left  — camera-left = user's right side of face exposed */
+    else if (check.id === 'left') {
+      const sY = Math.floor(H*.2), sH = Math.floor(H*.55), sW = Math.floor(W*.22)
+      const lB = brightness(data, 0, sY, sW, sH, W)
+      const rB = brightness(data, W-sW, sY, sW, sH, W)
+      turnBuf.current.push(rB - lB)
+      if (turnBuf.current.length > 12) turnBuf.current.shift()
+      const avg = turnBuf.current.reduce((a,b)=>a+b,0) / turnBuf.current.length
+      passed = avg > 6
+    }
+
+    /* turn right */
+    else if (check.id === 'right') {
+      const sY = Math.floor(H*.2), sH = Math.floor(H*.55), sW = Math.floor(W*.22)
+      const lB = brightness(data, 0, sY, sW, sH, W)
+      const rB = brightness(data, W-sW, sY, sW, sH, W)
+      turnBuf.current.push(lB - rB)
+      if (turnBuf.current.length > 12) turnBuf.current.shift()
+      const avg = turnBuf.current.reduce((a,b)=>a+b,0) / turnBuf.current.length
+      passed = avg > 6
+    }
+
+    /* smile */
+    else if (check.id === 'smile') {
+      const mY = Math.floor(H*.58), mH = Math.floor(H*.16)
+      const mX = Math.floor(W*.3),  mW = Math.floor(W*.4)
+      const mb = brightness(data, mX, mY, mW, mH, W)
+
+      if (smileBase.current === null) {
+        smileCalib.current.push(mb)
+        if (smileCalib.current.length >= 20) {
+          smileBase.current = smileCalib.current.reduce((a,b)=>a+b,0) / smileCalib.current.length
+          smileCalib.current = []
+        }
+      } else {
+        passed = (mb - smileBase.current) > 4.5
+      }
+    }
+
+    if (passed) {
+      const next = idx + 1
+      checksRef.current = checksRef.current.map((c,i) => i===idx ? {...c,done:true} : c)
+      setChecks([...checksRef.current])
+      idxRef.current = next
+      setActiveIdx(next)
+      resetAccum()
+
+      if (next >= checksRef.current.length) {
+        doneRef.current = true
+        setDone(true)
+        setHint('✅ ¡Perfecto!')
+        setTimeout(() => capturePhoto(), 700)
+        return
+      }
+    }
+
+    analysisRaf.current = requestAnimationFrame(analysisLoop)
+  }, [capturePhoto])
+
+  /* ── Start camera ──────────────────────────────────────────────────────── */
   const startCamera = useCallback(async () => {
-    setCameraError(null)
-    checksRef.current = buildChecks()
-    idxRef.current    = 0
-    capturingRef.current = false
-    setChecks(buildChecks())
-    setCurrentIdx(0)
-    setFaceInFrame(false)
-    setInstruction('')
-    setCapturing(false)
-    resetAccumulators()
+    setCamError(null)
+    checksRef.current = makeChecks(); idxRef.current = 0
+    doneRef.current = false; faceRef.current = false
+    setChecks(makeChecks()); setActiveIdx(0)
+    setFaceFound(false); setHint(''); setDone(false)
+    resetAccum()
 
     if (!navigator.mediaDevices?.getUserMedia) {
-      setCameraError('Tu navegador no soporta acceso a cámara. Usa Chrome o Firefox en localhost o HTTPS.')
+      setCamError('Tu navegador no soporta acceso a cámara. Usa Chrome o Firefox en localhost/HTTPS.')
       return
     }
 
-    const tries: any[] = [
-      { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
-      { facingMode: 'user' },
-      { facingMode: { ideal: 'user' } },
-      true,
+    const tries: MediaStreamConstraints[] = [
+      { video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } } },
+      { video: { facingMode: 'user' } },
+      { video: { facingMode: { ideal: 'user' } } },
+      { video: true },
     ]
 
     let stream: MediaStream | null = null
-    let lastErr: any = null
+    let lastErr: unknown = null
     for (const c of tries) {
-      try { stream = await navigator.mediaDevices.getUserMedia({ video: c }); break }
+      try { stream = await navigator.mediaDevices.getUserMedia(c); break }
       catch (e) { lastErr = e }
     }
 
     if (!stream) {
-      const n = lastErr?.name || ''
-      const map: Record<string, string> = {
-        NotAllowedError:       '🚫 Permiso denegado. Haz clic en el ícono de cámara en la barra del navegador y permite el acceso, luego recarga.',
-        PermissionDeniedError: '🚫 Permiso denegado. Haz clic en el ícono de cámara en la barra del navegador y permite el acceso, luego recarga.',
+      const n = (lastErr as any)?.name ?? ''
+      const msgs: Record<string,string> = {
+        NotAllowedError:       '🚫 Permiso denegado. Haz clic en el ícono de cámara en la barra del navegador y permite el acceso.',
+        PermissionDeniedError: '🚫 Permiso denegado. Haz clic en el ícono de cámara en la barra del navegador y permite el acceso.',
         NotFoundError:         '📷 No se detectó cámara en este dispositivo.',
         NotReadableError:      '⚠️ La cámara está siendo usada por otra aplicación.',
-        SecurityError:         '🔒 Acceso bloqueado. Abre la app en localhost o HTTPS.',
+        SecurityError:         '🔒 Acceso bloqueado. Abre en localhost o HTTPS.',
       }
-      setCameraError(map[n] || `No se pudo acceder a la cámara (${n || 'desconocido'}).`)
+      setCamError(msgs[n] ?? `No se pudo acceder a la cámara (${n || 'desconocido'}).`)
       return
     }
 
     streamRef.current = stream
+    const v = videoRef.current
+    if (!v) return
+
+    v.srcObject = stream
     setMode('camera')
 
-    const video = videoRef.current
-    if (video) {
-      video.srcObject = stream
-      video.onloadedmetadata = () => {
-        video.play().then(() => {
-          loopRef.current = requestAnimationFrame(analysisLoop)
-          drawRef.current = requestAnimationFrame(drawLoop)
+    // Wait until video has real dimensions before starting loops
+    v.onloadedmetadata = () => {
+      v.play().then(() => {
+        // give browser one more frame to paint
+        requestAnimationFrame(() => {
+          drawRaf.current     = requestAnimationFrame(drawLoop)
+          analysisRaf.current = requestAnimationFrame(analysisLoop)
         })
-      }
+      })
     }
-  }, [analysisLoop, drawLoop])
+  }, [drawLoop, analysisLoop])
 
-  // ── Analyze & confirm (after preview) ────────────────────────────────────
-
+  /* ── Analyze & advance ─────────────────────────────────────────────────── */
   const analyzeAndConfirm = async () => {
-    setMode('analyzing')
-    setAnalysisProgress(0)
-    for (const p of [15, 35, 55, 72, 88, 95, 100]) {
+    setMode('analyzing'); setProgress(0)
+    for (const p of [15,35,55,72,88,95,100]) {
       await new Promise(r => setTimeout(r, 400))
-      setAnalysisProgress(p)
+      setProgress(p)
     }
-    const score = Math.floor(Math.random() * 10) + 90
-    if (capturedImage) {
-      setSelfie(capturedImage, score)
+    if (snapshot) {
+      setSelfie(snapshot, Math.floor(Math.random()*10)+90)
       completeStep('selfie')
       setStep('review')
     }
   }
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    const reader = new FileReader()
-    reader.onloadend = () => { setCaptured(reader.result as string); setMode('preview') }
-    reader.readAsDataURL(file)
+  const retake = () => { setSnapshot(null); setMode('guide') }
+
+  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0]; if (!f) return
+    const r = new FileReader()
+    r.onloadend = () => { setSnapshot(r.result as string); setMode('preview') }
+    r.readAsDataURL(f)
   }
 
-  const retake = () => { setCaptured(null); setMode('guide') }
-
-  const allDone = currentIdx >= checks.length
-
-  // ── Render ────────────────────────────────────────────────────────────────
-
+  /* ── Render ──────────────────────────────────────────────────────────────── */
   return (
     <div className="fade-in-up max-w-xl mx-auto">
+
       {/* Header */}
       <div className="flex items-center gap-3 mb-6">
         <div className="w-10 h-10 rounded-xl bg-amber-500/15 flex items-center justify-center">
           <Eye size={18} className="text-amber-400" />
         </div>
         <div>
-          <h2 className="text-xl font-bold text-white" style={{ fontFamily: 'Syne, sans-serif' }}>
+          <h2 className="text-xl font-bold text-white" style={{fontFamily:'Syne,sans-serif'}}>
             Verificación Facial en Vivo
           </h2>
           <p className="text-xs text-zinc-500">Sigue las instrucciones en pantalla</p>
         </div>
       </div>
 
-      {/* Error */}
-      {cameraError && (
+      {/* Error banner */}
+      {camError && (
         <div className="flex flex-col gap-3 p-4 rounded-xl bg-red-500/10 border border-red-500/20 mb-4">
           <div className="flex items-start gap-3">
             <AlertCircle size={16} className="text-red-400 mt-0.5 flex-shrink-0" />
-            <p className="text-sm text-red-300 leading-relaxed">{cameraError}</p>
+            <p className="text-sm text-red-300 leading-relaxed">{camError}</p>
           </div>
           <div className="flex gap-2 pl-7">
-            <button onClick={() => { setCameraError(null); startCamera() }}
+            <button onClick={() => { setCamError(null); startCamera() }}
               className="text-xs px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-zinc-300 hover:bg-white/10 transition-all">
               🔄 Reintentar
             </button>
-            <button onClick={() => { setCameraError(null); fileInputRef.current?.click() }}
+            <button onClick={() => { setCamError(null); fileRef.current?.click() }}
               className="text-xs px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-400 hover:bg-amber-500/20 transition-all">
-              📁 Cargar foto manualmente
+              📁 Cargar foto
             </button>
           </div>
         </div>
       )}
 
-      {/* ── GUIDE ── */}
+      {/* ════ GUIDE ════ */}
       {mode === 'guide' && (
         <div className="space-y-4">
           <div className="bg-[#0f0f14] border border-white/8 rounded-2xl overflow-hidden aspect-[4/3] flex items-center justify-center">
             <div className="relative w-44 h-56 border-2 border-amber-500/50 rounded-full oval-pulse flex items-center justify-center">
-              <div className="text-6xl select-none">👤</div>
-              <div className="absolute -top-1 -left-1 w-4 h-4 border-t-2 border-l-2 border-amber-400" />
+              <span className="text-6xl select-none">👤</span>
+              <div className="absolute -top-1 -left-1  w-4 h-4 border-t-2 border-l-2 border-amber-400" />
               <div className="absolute -top-1 -right-1 w-4 h-4 border-t-2 border-r-2 border-amber-400" />
-              <div className="absolute -bottom-1 -left-1 w-4 h-4 border-b-2 border-l-2 border-amber-400" />
+              <div className="absolute -bottom-1 -left-1  w-4 h-4 border-b-2 border-l-2 border-amber-400" />
               <div className="absolute -bottom-1 -right-1 w-4 h-4 border-b-2 border-r-2 border-amber-400" />
             </div>
           </div>
           <div className="grid grid-cols-2 gap-2">
-            {['✅ Buena iluminación frontal', '✅ Fondo claro', '❌ Sin lentes de sol', '❌ Sin cubrir el rostro'].map((t, i) => (
-              <div key={i} className={clsx('text-xs px-3 py-2 rounded-lg', t.startsWith('✅') ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400')}>
-                {t}
-              </div>
+            {['✅ Buena iluminación frontal','✅ Fondo claro','❌ Sin lentes de sol','❌ Sin cubrir el rostro'].map((t,i) => (
+              <div key={i} className={clsx('text-xs px-3 py-2 rounded-lg', t.startsWith('✅') ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400')}>{t}</div>
             ))}
           </div>
           <button onClick={startCamera}
-            className="w-full flex items-center justify-center gap-3 py-4 rounded-2xl bg-gradient-to-r from-amber-500 to-yellow-400 text-black font-bold text-sm hover:scale-[1.02] hover:shadow-lg hover:shadow-amber-500/25 transition-all"
-            style={{ fontFamily: 'Syne, sans-serif' }}>
-            <Camera size={18} /> Iniciar verificación facial
+            className="w-full flex items-center justify-center gap-3 py-4 rounded-2xl bg-gradient-to-r from-amber-500 to-yellow-400 text-black font-bold text-sm hover:scale-[1.02] hover:shadow-amber-500/25 hover:shadow-lg transition-all"
+            style={{fontFamily:'Syne,sans-serif'}}>
+            <Camera size={18}/> Iniciar verificación facial
           </button>
-          <button onClick={() => fileInputRef.current?.click()}
+          <button onClick={() => fileRef.current?.click()}
             className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-white/5 border border-white/8 text-zinc-400 text-sm hover:bg-white/8 transition-all">
-            <Upload size={15} /> Subir selfie desde galería
+            <Upload size={15}/> Subir selfie desde galería
           </button>
-          <input ref={fileInputRef} type="file" accept="image/*" capture="user" className="hidden" onChange={handleFileUpload} />
+          <input ref={fileRef} type="file" accept="image/*" capture="user" className="hidden" onChange={handleFile}/>
         </div>
       )}
 
-      {/* ── CAMERA ── */}
+      {/* ════ CAMERA ════ */}
       {mode === 'camera' && (
         <div className="space-y-4">
-          {/* Hidden video + sample canvas */}
-          <video ref={videoRef} autoPlay playsInline muted className="absolute opacity-0 pointer-events-none w-0 h-0" />
-          <canvas ref={sampleCanvas} className="hidden" />
 
-          {/* Visible overlay canvas */}
+          {/*
+            KEY LAYOUT:
+            - <video> fills the container, visible, mirrored via CSS
+            - <canvas> sits absolutely on top, transparent background, draws only the oval mask + scan line
+            - offscreen <canvas> for pixel analysis (hidden, zero size)
+          */}
           <div className="relative rounded-2xl overflow-hidden bg-black aspect-[4/3]">
-            <canvas ref={overlayRef} className="w-full h-full object-contain" />
 
-            {/* Face badge */}
+            {/* ① The actual camera feed — CSS mirror so user sees themselves */}
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              style={{ transform: 'scaleX(-1)' }}
+              className="absolute inset-0 w-full h-full object-cover"
+            />
+
+            {/* ② Overlay canvas — only draws oval mask + scan line on top */}
+            <canvas
+              ref={overlayRef}
+              className="absolute inset-0 w-full h-full pointer-events-none"
+            />
+
+            {/* ③ Face badge */}
             <div className={clsx(
               'absolute top-3 left-3 flex items-center gap-2 backdrop-blur-sm px-3 py-1.5 rounded-full border transition-all duration-300',
-              faceInFrame ? 'bg-green-500/20 border-green-500/30' : 'bg-zinc-900/70 border-white/10'
+              faceFound ? 'bg-green-500/20 border-green-500/30' : 'bg-zinc-900/70 border-white/10'
             )}>
-              <div className={clsx('w-2 h-2 rounded-full', faceInFrame ? 'bg-green-400 animate-pulse' : 'bg-zinc-600')} />
-              <span className={clsx('text-xs font-medium', faceInFrame ? 'text-green-400' : 'text-zinc-500')}>
-                {faceInFrame ? 'Rostro detectado' : 'Buscando rostro...'}
+              <div className={clsx('w-2 h-2 rounded-full', faceFound ? 'bg-green-400 animate-pulse' : 'bg-zinc-600')} />
+              <span className={clsx('text-xs font-medium', faceFound ? 'text-green-400' : 'text-zinc-500')}>
+                {faceFound ? 'Rostro detectado' : 'Buscando rostro...'}
               </span>
             </div>
 
-            {/* Instruction bubble */}
-            {!capturing && instruction && !allDone && (
+            {/* ④ Instruction bubble */}
+            {hint && !done && (
               <div className="absolute bottom-4 left-0 right-0 flex justify-center px-4">
-                <div className="bg-black/75 backdrop-blur-sm px-4 py-2 rounded-full border border-white/10 max-w-xs text-center">
-                  <p className="text-sm text-white font-medium">{instruction}</p>
+                <div className="bg-black/75 backdrop-blur-sm px-4 py-2 rounded-full border border-white/10">
+                  <p className="text-sm text-white font-medium text-center">{hint}</p>
                 </div>
               </div>
             )}
-
-            {/* All done overlay */}
-            {(allDone || capturing) && (
+            {done && (
               <div className="absolute bottom-4 left-0 right-0 flex justify-center">
                 <div className="bg-green-500/20 border border-green-500/40 backdrop-blur-sm px-4 py-2 rounded-full">
                   <p className="text-sm text-green-400 font-medium">✅ ¡Perfecto! Tomando foto...</p>
@@ -553,24 +506,26 @@ export default function SelfieStep() {
             )}
           </div>
 
+          {/* Hidden offscreen canvas for pixel analysis */}
+          <canvas ref={sampleRef} className="hidden" />
+
           {/* Checklist */}
           <div className="bg-white/3 rounded-xl p-4">
             <p className="text-xs text-zinc-500 mb-3 font-medium uppercase tracking-wider">Verificación de vida</p>
             <div className="space-y-2.5">
-              {checks.map((check, i) => (
-                <div key={check.id} className={clsx(
+              {checks.map((ch, i) => (
+                <div key={ch.id} className={clsx(
                   'flex items-center gap-3 text-sm transition-all duration-300',
-                  check.done ? 'text-green-400' : i === currentIdx ? 'text-amber-300' : 'text-zinc-600'
+                  ch.done ? 'text-green-400' : i === activeIdx ? 'text-amber-300' : 'text-zinc-600'
                 )}>
-                  {check.done ? (
-                    <CheckCircle2 size={16} className="flex-shrink-0" />
-                  ) : i === currentIdx ? (
-                    <div className="w-4 h-4 rounded-full border-2 border-amber-400 border-t-transparent animate-spin flex-shrink-0" />
-                  ) : (
-                    <div className="w-4 h-4 rounded-full border border-zinc-700 flex-shrink-0" />
-                  )}
-                  <span>{check.label}</span>
-                  {i === currentIdx && !check.done && (
+                  {ch.done
+                    ? <CheckCircle2 size={16} className="flex-shrink-0"/>
+                    : i === activeIdx
+                      ? <div className="w-4 h-4 rounded-full border-2 border-amber-400 border-t-transparent animate-spin flex-shrink-0"/>
+                      : <div className="w-4 h-4 rounded-full border border-zinc-700 flex-shrink-0"/>
+                  }
+                  <span>{ch.label}</span>
+                  {i === activeIdx && !ch.done && (
                     <span className="ml-auto text-[10px] text-amber-500 font-medium uppercase tracking-wide">EN CURSO</span>
                   )}
                 </div>
@@ -578,72 +533,71 @@ export default function SelfieStep() {
             </div>
           </div>
 
-          <button onClick={() => { stopAll(); setMode('guide') }}
+          <button onClick={() => { stopCamera(); setMode('guide') }}
             className="w-full py-3 rounded-xl bg-white/5 border border-white/8 text-zinc-400 text-sm hover:bg-white/8 transition-all">
             Cancelar
           </button>
         </div>
       )}
 
-      {/* ── PREVIEW ── */}
-      {mode === 'preview' && capturedImage && (
+      {/* ════ PREVIEW ════ */}
+      {mode === 'preview' && snapshot && (
         <div className="space-y-4">
           <div className="relative rounded-2xl overflow-hidden border border-white/10 aspect-[4/3]">
-            <img src={capturedImage} alt="Selfie" className="w-full h-full object-cover" />
+            <img src={snapshot} alt="Selfie" className="w-full h-full object-cover"/>
             <div className="absolute top-3 right-3 flex items-center gap-2 bg-black/60 backdrop-blur-sm px-3 py-1.5 rounded-full">
-              <div className="w-2 h-2 rounded-full bg-green-400" />
+              <div className="w-2 h-2 rounded-full bg-green-400"/>
               <span className="text-xs text-green-400 font-medium">Prueba de vida completada</span>
             </div>
           </div>
           <p className="text-xs text-zinc-500 text-center">¿Tu rostro está claramente visible?</p>
           <div className="flex gap-3">
             <button onClick={retake} className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-white/5 border border-white/8 text-zinc-300 text-sm">
-              <RefreshCw size={14} /> Repetir
+              <RefreshCw size={14}/> Repetir
             </button>
             <button onClick={analyzeAndConfirm}
               className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-400 text-black font-bold text-sm hover:scale-[1.02] transition-all"
-              style={{ fontFamily: 'Syne, sans-serif' }}>
-              <Check size={16} /> Confirmar <ArrowRight size={14} />
+              style={{fontFamily:'Syne,sans-serif'}}>
+              <Check size={16}/> Confirmar <ArrowRight size={14}/>
             </button>
           </div>
         </div>
       )}
 
-      {/* ── ANALYZING ── */}
+      {/* ════ ANALYZING ════ */}
       {mode === 'analyzing' && (
         <div className="text-center py-8 space-y-6">
           <div className="relative w-32 h-32 mx-auto">
-            {capturedImage && (
-              <img src={capturedImage} alt="Analyzing" className="w-full h-full object-cover rounded-full border-2 border-amber-500/40" />
-            )}
+            {snapshot && <img src={snapshot} alt="" className="w-full h-full object-cover rounded-full border-2 border-amber-500/40"/>}
             <svg className="absolute inset-0 w-full h-full -rotate-90" viewBox="0 0 128 128">
-              <circle cx="64" cy="64" r="60" fill="none" stroke="#27272a" strokeWidth="4" />
+              <circle cx="64" cy="64" r="60" fill="none" stroke="#27272a" strokeWidth="4"/>
               <circle cx="64" cy="64" r="60" fill="none" stroke="#f59e0b" strokeWidth="4"
                 strokeLinecap="round"
-                strokeDasharray={`${2 * Math.PI * 60}`}
-                strokeDashoffset={`${2 * Math.PI * 60 * (1 - analysisProgress / 100)}`}
-                style={{ transition: 'stroke-dashoffset 0.4s ease' }} />
+                strokeDasharray={`${2*Math.PI*60}`}
+                strokeDashoffset={`${2*Math.PI*60*(1-progress/100)}`}
+                style={{transition:'stroke-dashoffset 0.4s ease'}}/>
             </svg>
           </div>
           <div>
-            <p className="text-lg font-bold text-white mb-1" style={{ fontFamily: 'Syne, sans-serif' }}>Analizando biometría...</p>
-            <p className="text-sm text-zinc-500">{analysisProgress}% completado</p>
+            <p className="text-lg font-bold text-white mb-1" style={{fontFamily:'Syne,sans-serif'}}>Analizando biometría...</p>
+            <p className="text-sm text-zinc-500">{progress}% completado</p>
           </div>
           <div className="space-y-2 text-left max-w-xs mx-auto">
             {[
-              { label: 'Detección de rostro',         done: analysisProgress > 20 },
-              { label: 'Validación prueba de vida',    done: analysisProgress > 50 },
-              { label: 'Análisis biométrico',          done: analysisProgress > 75 },
-              { label: 'Validación final',             done: analysisProgress >= 100 },
-            ].map(item => (
-              <div key={item.label} className={clsx('flex items-center gap-3 text-xs', item.done ? 'text-green-400' : 'text-zinc-600')}>
-                {item.done ? <CheckCircle2 size={14} /> : <div className="w-3.5 h-3.5 rounded-full border border-zinc-700" />}
-                {item.label}
+              {label:'Detección de rostro',       done: progress>20},
+              {label:'Validación prueba de vida',  done: progress>50},
+              {label:'Análisis biométrico',        done: progress>75},
+              {label:'Validación final',           done: progress>=100},
+            ].map(it => (
+              <div key={it.label} className={clsx('flex items-center gap-3 text-xs', it.done ? 'text-green-400' : 'text-zinc-600')}>
+                {it.done ? <CheckCircle2 size={14}/> : <div className="w-3.5 h-3.5 rounded-full border border-zinc-700"/>}
+                {it.label}
               </div>
             ))}
           </div>
         </div>
       )}
+
     </div>
   )
 }
