@@ -1,10 +1,7 @@
 'use client'
 
 import { useRef, useState, useEffect } from 'react'
-import {
-  Eye, Camera, RefreshCw, Check, ArrowRight,
-  AlertCircle, CheckCircle2, Upload, Loader2,
-} from 'lucide-react'
+import { Eye, Camera, RefreshCw, Check, ArrowRight, AlertCircle, CheckCircle2, Upload } from 'lucide-react'
 import { useKYCStore } from '@/lib/kyc-store'
 import clsx from 'clsx'
 
@@ -22,81 +19,69 @@ function freshItems(): LivenessItem[] {
   ]
 }
 
-/* ─── MediaPipe landmark indices ─────────────────────────────────────────── */
-// Eye corners for EAR (Eye Aspect Ratio) — blink detection
-const LEFT_EYE  = [33, 160, 158, 133, 153, 144]   // p1,p2,p3,p4,p5,p6
-const RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-// Mouth corners + top/bottom for MAR (Mouth Aspect Ratio) — smile
-const MOUTH_CORNERS = [61, 291]   // left, right corner
-const MOUTH_TOP     = [13]
-const MOUTH_BOTTOM  = [14]
-// Nose tip for yaw (head turn)
-const NOSE_TIP  = 1
-const LEFT_CHEEK  = 234
-const RIGHT_CHEEK = 454
-// Face bbox landmarks
-const FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
-                   397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
-                   172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
+/* ─── Landmark math ──────────────────────────────────────────────────────── */
+function dist2D(a: any, b: any) { return Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2) }
 
-function earScore(lm: any[], indices: number[]): number {
-  const p = indices.map(i => lm[i])
-  // EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)
-  const d26 = dist(p[1], p[5])
-  const d35 = dist(p[2], p[4])
-  const d14 = dist(p[0], p[3])
-  return d14 > 0 ? (d26 + d35) / (2 * d14) : 0
+// Eye Aspect Ratio  (p0=outer, p1,p2=top, p3=inner, p4,p5=bottom)
+const L_EYE = [33,160,158,133,153,144]
+const R_EYE = [362,385,387,263,373,380]
+function ear(lm: any[], idx: number[]): number {
+  const p = idx.map(i=>lm[i])
+  const num = dist2D(p[1],p[5]) + dist2D(p[2],p[4])
+  const den = 2 * dist2D(p[0],p[3])
+  return den>0 ? num/den : 0
 }
 
-function dist(a: any, b: any): number {
-  return Math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2)
+// Yaw: (nose_x - midCheek_x) / cheekSpan  →  negative=left, positive=right
+const NOSE=1, L_CHEEK=234, R_CHEEK=454
+function yaw(lm: any[]): number {
+  const mid = (lm[L_CHEEK].x + lm[R_CHEEK].x) / 2
+  const span = Math.abs(lm[R_CHEEK].x - lm[L_CHEEK].x)
+  return span>0 ? (lm[NOSE].x - mid) / span : 0
 }
 
-function mouthWidth(lm: any[]): number {
-  return dist(lm[MOUTH_CORNERS[0]], lm[MOUTH_CORNERS[1]])
-}
-
-function mouthOpenness(lm: any[]): number {
-  return dist(lm[MOUTH_TOP[0]], lm[MOUTH_BOTTOM[0]])
-}
-
-// Yaw: compare nose tip x vs midpoint of cheeks
-function yawRatio(lm: any[]): number {
-  const nose  = lm[NOSE_TIP]
-  const left  = lm[LEFT_CHEEK]
-  const right = lm[RIGHT_CHEEK]
-  const mid   = (left.x + right.x) / 2
-  const span  = Math.abs(right.x - left.x)
-  return span > 0 ? (nose.x - mid) / span : 0
-  // positive = nose right of center = head turned RIGHT
-  // negative = nose left of center  = head turned LEFT
-}
-
-// How centered is face in frame (0 = perfect center)
-function faceCenterOffset(lm: any[]): { dx: number; dy: number; size: number } {
-  const nose = lm[NOSE_TIP]
-  const dx = Math.abs(nose.x - 0.5)   // 0–0.5
-  const dy = Math.abs(nose.y - 0.45)  // 0–0.5, slightly above center
-  const left  = lm[LEFT_CHEEK]
-  const right = lm[RIGHT_CHEEK]
-  const size  = dist(left, right)      // normalized face width ~0.3–0.5
+// Face center offset from ideal (0=perfect)
+function centerOffset(lm: any[]) {
+  const dx = Math.abs(lm[NOSE].x - 0.5)
+  const dy = Math.abs(lm[NOSE].y - 0.46)
+  const size = dist2D(lm[L_CHEEK], lm[R_CHEEK])
   return { dx, dy, size }
+}
+
+// Mouth width / openness
+const M_LEFT=61, M_RIGHT=291, M_TOP=13, M_BOT=14
+function mouthMetrics(lm: any[]) {
+  return {
+    width:    dist2D(lm[M_LEFT], lm[M_RIGHT]),
+    openness: dist2D(lm[M_TOP],  lm[M_BOT]),
+  }
+}
+
+/* ─── Load external script (idempotent) ─────────────────────────────────── */
+function loadScript(src: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return }
+    const s = document.createElement('script')
+    s.src = src; s.crossOrigin='anonymous'
+    s.onload=()=>resolve(); s.onerror=()=>reject(new Error(`Failed: ${src}`))
+    document.head.appendChild(s)
+  })
 }
 
 /* ─── Component ──────────────────────────────────────────────────────────── */
 export default function SelfieStep() {
   const { setStep, setSelfie, completeStep } = useKYCStore()
 
-  const [screen,    setScreen]   = useState<ScreenMode>('guide')
-  const [photo,     setPhoto]    = useState<string|null>(null)
-  const [items,     setItems]    = useState<LivenessItem[]>(freshItems())
-  const [activeI,   setActiveI]  = useState(0)
-  const [face,      setFace]     = useState(false)
-  const [hint,      setHint]     = useState('')
-  const [done,      setDone]     = useState(false)
-  const [err,       setErr]      = useState<string|null>(null)
-  const [aprogress, setAprogress]= useState(0)
-  const [loadMsg,   setLoadMsg]  = useState('Cargando modelo de detección...')
+  const [screen,    setScreen]    = useState<ScreenMode>('guide')
+  const [photo,     setPhoto]     = useState<string|null>(null)
+  const [items,     setItems]     = useState<LivenessItem[]>(freshItems())
+  const [activeI,   setActiveI]   = useState(0)
+  const [face,      setFace]      = useState(false)
+  const [hint,      setHint]      = useState('')
+  const [done,      setDone]      = useState(false)
+  const [err,       setErr]       = useState<string|null>(null)
+  const [loadMsg,   setLoadMsg]   = useState('')
+  const [aprogress, setAprogress] = useState(0)
 
   /* DOM */
   const videoRef   = useRef<HTMLVideoElement>(null)
@@ -105,55 +90,57 @@ export default function SelfieStep() {
   const fileRef    = useRef<HTMLInputElement>(null)
 
   /* Runtime */
-  const streamRef  = useRef<MediaStream|null>(null)
-  const faceMeshRef= useRef<any>(null)
-  const cameraRef  = useRef<any>(null)   // MediaPipe Camera helper
-  const drawRaf    = useRef(0)
-  const itemsR     = useRef(freshItems())
-  const idxR       = useRef(0)
-  const faceR      = useRef(false)
-  const doneR      = useRef(false)
-  const lastLM     = useRef<any[]|null>(null)  // latest landmarks
+  const streamRef   = useRef<MediaStream|null>(null)
+  const meshRef     = useRef<any>(null)
+  const drawRafRef  = useRef(0)
+  const loopRafRef  = useRef(0)
 
-  /* Per-check accumulators */
-  const centerOk   = useRef(0)       // frames face is centered
-  const blinkCount = useRef(0)
-  const blinkBase  = useRef<number[]>([])   // rolling EAR baseline
-  const blinkCool  = useRef(0)
-  const turnBuf    = useRef<number[]>([])   // rolling yaw
-  const smileBase  = useRef<number[]>([])   // rolling mouth width baseline
-  const smileDone  = useRef(false)
+  /* Mutable check state */
+  const itemsR  = useRef(freshItems())
+  const idxR    = useRef(0)
+  const faceR   = useRef(false)
+  const doneR   = useRef(false)
+  const lastLM  = useRef<any[]|null>(null)
+
+  /* Accumulators */
+  const cOk        = useRef(0)
+  const bCount     = useRef(0)
+  const bBuf       = useRef<number[]>([])   // rolling EAR buffer
+  const bCool      = useRef(0)
+  const tBuf       = useRef<number[]>([])   // rolling yaw
+  const sBuf       = useRef<number[]>([])   // rolling mouth width (calibration)
+  const sBaseline  = useRef<number|null>(null)
+  const sDone      = useRef(false)
 
   function resetAccum() {
-    centerOk.current=0
-    blinkCount.current=0; blinkBase.current=[]; blinkCool.current=0
-    turnBuf.current=[]
-    smileBase.current=[]; smileDone.current=false
+    cOk.current=0
+    bCount.current=0; bBuf.current=[]; bCool.current=0
+    tBuf.current=[]
+    sBuf.current=[]; sBaseline.current=null; sDone.current=false
   }
 
-  /* ── Cleanup ─────────────────────────────────────────────────────────── */
+  /* ── Stop ────────────────────────────────────────────────────────────── */
   function stopAll() {
-    cancelAnimationFrame(drawRaf.current)
-    cameraRef.current?.stop()
+    cancelAnimationFrame(drawRafRef.current)
+    cancelAnimationFrame(loopRafRef.current)
     streamRef.current?.getTracks().forEach(t=>t.stop())
     streamRef.current=null
-    cameraRef.current=null
   }
-  useEffect(()=>()=>stopAll(),[])
+  useEffect(()=>()=>stopAll(), []) // eslint-disable-line
 
-  /* ── Draw overlay loop (runs independently of MediaPipe) ─────────────── */
-  function runDraw() {
+  /* ── Overlay draw loop ───────────────────────────────────────────────── */
+  function startDraw() {
     function tick() {
-      const ov=overlayRef.current
-      if(!ov){drawRaf.current=requestAnimationFrame(tick);return}
+      const ov = overlayRef.current
+      if (!ov) { drawRafRef.current=requestAnimationFrame(tick); return }
       const W=ov.offsetWidth||640, H=ov.offsetHeight||480
-      if(ov.width!==W) ov.width=W
-      if(ov.height!==H) ov.height=H
-      const ctx=ov.getContext('2d')!
+      if (ov.width!==W) ov.width=W
+      if (ov.height!==H) ov.height=H
+      const ctx = ov.getContext('2d')!
       ctx.clearRect(0,0,W,H)
       const cx=W/2, cy=H/2, rx=W*.26, ry=H*.43
 
-      // dark vignette outside oval
+      // vignette
       ctx.save()
       ctx.beginPath(); ctx.rect(0,0,W,H)
       ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2)
@@ -164,240 +151,248 @@ export default function SelfieStep() {
       ctx.strokeStyle=faceR.current?'#4ade80':'#f59e0b'
       ctx.lineWidth=3; ctx.stroke()
 
-      // draw MediaPipe landmarks if available
-      if(faceR.current && lastLM.current && !doneR.current){
-        const lm=lastLM.current
-        ctx.fillStyle='rgba(74,222,128,0.5)'
-        // draw a few key points (eyes, nose, mouth)
-        const keyPts=[1,33,263,61,291,159,386]
-        for(const i of keyPts){
-          const p=lm[i]
-          if(!p) continue
-          // landmarks are 0–1 normalized, mirror X because video is CSS-mirrored
-          const px=(1-p.x)*W, py=p.y*H
-          ctx.beginPath(); ctx.arc(px,py,2.5,0,Math.PI*2); ctx.fill()
+      // landmarks + scan line when face detected
+      if (faceR.current && lastLM.current && !doneR.current) {
+        // key dots (mirrored: x → 1-x because video is CSS-flipped)
+        ctx.fillStyle='rgba(74,222,128,0.7)'
+        for (const i of [1,33,263,61,291,159,386,234,454]) {
+          const p=lastLM.current[i]; if(!p) continue
+          ctx.beginPath(); ctx.arc((1-p.x)*W, p.y*H, 2.5,0,Math.PI*2); ctx.fill()
         }
-
         // scan line
         const t=(Date.now()%2000)/2000
         const sy=(cy-ry)+t*ry*2
         const g=ctx.createLinearGradient(cx-rx,0,cx+rx,0)
-        g.addColorStop(0,'transparent'); g.addColorStop(.5,'rgba(74,222,128,0.75)'); g.addColorStop(1,'transparent')
+        g.addColorStop(0,'transparent'); g.addColorStop(.5,'rgba(74,222,128,0.8)'); g.addColorStop(1,'transparent')
         ctx.beginPath(); ctx.moveTo(cx-rx,sy); ctx.lineTo(cx+rx,sy)
         ctx.strokeStyle=g; ctx.lineWidth=2; ctx.stroke()
       }
 
-      drawRaf.current=requestAnimationFrame(tick)
+      drawRafRef.current=requestAnimationFrame(tick)
     }
-    drawRaf.current=requestAnimationFrame(tick)
+    drawRafRef.current=requestAnimationFrame(tick)
   }
 
-  /* ── Process landmarks each frame ────────────────────────────────────── */
-  function processLandmarks(lm: any[]) {
-    if(doneR.current) return
-    lastLM.current=lm
-    faceR.current=true; setFace(true)
+  /* ── FaceMesh frame loop — feeds existing <video> stream, no new camera ─ */
+  function startMeshLoop() {
+    let processing=false
+    function tick() {
+      if (doneR.current) return
+      const v=videoRef.current
+      if (!v || v.readyState<2 || !meshRef.current || processing) {
+        loopRafRef.current=requestAnimationFrame(tick); return
+      }
+      processing=true
+      meshRef.current.send({image: v}).then(()=>{
+        processing=false
+        loopRafRef.current=requestAnimationFrame(tick)
+      }).catch(()=>{
+        processing=false
+        loopRafRef.current=requestAnimationFrame(tick)
+      })
+    }
+    loopRafRef.current=requestAnimationFrame(tick)
+  }
+
+  /* ── Attach stream to video after React renders <video> ─────────────── */
+  useEffect(()=>{
+    if (screen!=='camera') return
+    const v=videoRef.current
+    if (!v || !streamRef.current || !meshRef.current) return
+
+    // Attach the EXISTING stream (no new getUserMedia call)
+    v.srcObject=streamRef.current
+    v.onloadedmetadata=()=>{
+      v.play().catch(()=>{})
+      startDraw()
+      startMeshLoop()
+    }
+    // If metadata already loaded (stream reuse), trigger manually
+    if (v.readyState >= 1) {
+      v.play().catch(()=>{})
+      startDraw()
+      startMeshLoop()
+    }
+  }, [screen]) // eslint-disable-line
+
+  /* ── Process FaceMesh results ────────────────────────────────────────── */
+  function onResults(results: any) {
+    if (doneR.current) return
+
+    if (!results.multiFaceLandmarks?.length) {
+      faceR.current=false; lastLM.current=null
+      setFace(false)
+      if (!doneR.current) setHint('👤 Coloca tu cara dentro del óvalo')
+      return
+    }
+
+    const lm = results.multiFaceLandmarks[0]
+    faceR.current=true; lastLM.current=lm; setFace(true)
 
     const idx  = idxR.current
     const item = itemsR.current[idx]
-    if(!item) return
-
+    if (!item) return
     setHint(item.instruction)
+
     let passed=false
 
-    /* ── CENTER: face must be centered in oval, right size ── */
-    if(item.id==='center'){
-      const {dx,dy,size}=faceCenterOffset(lm)
-      const centered = dx<0.08 && dy<0.10 && size>0.25 && size<0.65
-      if(centered) centerOk.current++
-      else centerOk.current=Math.max(0,centerOk.current-1)
-      passed = centerOk.current > 20  // ~0.7s
+    /* CENTER */
+    if (item.id==='center') {
+      const {dx,dy,size} = centerOffset(lm)
+      const ok = dx<0.09 && dy<0.10 && size>0.22 && size<0.70
+      cOk.current = ok ? cOk.current+1 : Math.max(0,cOk.current-2)
+      passed = cOk.current>18
     }
 
-    /* ── BLINK: EAR drops below threshold twice ── */
-    else if(item.id==='blink'){
-      const leftEAR  = earScore(lm, LEFT_EYE)
-      const rightEAR = earScore(lm, RIGHT_EYE)
-      const ear      = (leftEAR+rightEAR)/2
-
-      // build rolling baseline (open eyes)
-      if(blinkCool.current>0){ blinkCool.current--; return }
-
-      blinkBase.current.push(ear)
-      if(blinkBase.current.length>40) blinkBase.current.shift()
-
-      if(blinkBase.current.length>=20){
-        const baseline=blinkBase.current.slice(0,15).reduce((a,b)=>a+b,0)/15
-        const threshold=baseline*0.65  // eyes closed = EAR drops to <65% of baseline
-        if(ear<threshold){
-          blinkCount.current++
-          blinkCool.current=15  // ignore next 15 frames (avoid double-count)
-          blinkBase.current=[]
+    /* BLINK — EAR */
+    else if (item.id==='blink') {
+      const avgEAR = (ear(lm,L_EYE)+ear(lm,R_EYE))/2
+      if (bCool.current>0) { bCool.current--; return }
+      bBuf.current.push(avgEAR)
+      if (bBuf.current.length>50) bBuf.current.shift()
+      if (bBuf.current.length>=25) {
+        // baseline = median of last 20 open-eye frames
+        const sorted=[...bBuf.current].sort((a,b)=>a-b)
+        const baseline=sorted[Math.floor(sorted.length*0.75)]  // 75th percentile = open eyes
+        if (avgEAR < baseline*0.62) {
+          bCount.current++
+          bCool.current=12
+          bBuf.current=[]
         }
       }
-      passed = blinkCount.current>=2
+      passed = bCount.current>=2
     }
 
-    /* ── TURN LEFT: yaw < -0.12 for several frames ── */
-    else if(item.id==='left'){
-      const yaw=yawRatio(lm)
-      turnBuf.current.push(yaw)
-      if(turnBuf.current.length>15) turnBuf.current.shift()
-      const avg=turnBuf.current.reduce((a,b)=>a+b,0)/turnBuf.current.length
-      passed = turnBuf.current.length>=10 && avg < -0.12
+    /* TURN LEFT — yaw negative */
+    else if (item.id==='left') {
+      tBuf.current.push(yaw(lm))
+      if (tBuf.current.length>18) tBuf.current.shift()
+      const avg=tBuf.current.reduce((a,b)=>a+b,0)/tBuf.current.length
+      passed = tBuf.current.length>=12 && avg < -0.11
     }
 
-    /* ── TURN RIGHT: yaw > +0.12 for several frames ── */
-    else if(item.id==='right'){
-      const yaw=yawRatio(lm)
-      turnBuf.current.push(yaw)
-      if(turnBuf.current.length>15) turnBuf.current.shift()
-      const avg=turnBuf.current.reduce((a,b)=>a+b,0)/turnBuf.current.length
-      passed = turnBuf.current.length>=10 && avg > 0.12
+    /* TURN RIGHT — yaw positive */
+    else if (item.id==='right') {
+      tBuf.current.push(yaw(lm))
+      if (tBuf.current.length>18) tBuf.current.shift()
+      const avg=tBuf.current.reduce((a,b)=>a+b,0)/tBuf.current.length
+      passed = tBuf.current.length>=12 && avg > 0.11
     }
 
-    /* ── SMILE: mouth width increases significantly vs neutral baseline ── */
-    else if(item.id==='smile'){
-      const w=mouthWidth(lm)
-      const o=mouthOpenness(lm)
-
-      // calibrate neutral mouth width baseline
-      if(smileBase.current.length<25){
-        smileBase.current.push(w)
-      } else {
-        const baseline=smileBase.current.reduce((a,b)=>a+b,0)/smileBase.current.length
-        // smile: width increases AND slight openness
-        const smiling = w>baseline*1.18 && o>0.015
-        if(smiling && !smileDone.current){
-          smileDone.current=true
-          passed=true
+    /* SMILE — mouth width vs calibrated neutral */
+    else if (item.id==='smile') {
+      const {width, openness} = mouthMetrics(lm)
+      if (sBaseline.current===null) {
+        sBuf.current.push(width)
+        if (sBuf.current.length>=30) {
+          // use median as neutral baseline (robust to outliers)
+          const s=[...sBuf.current].sort((a,b)=>a-b)
+          sBaseline.current = s[Math.floor(s.length/2)]
+        }
+      } else if (!sDone.current) {
+        const ratio = width / sBaseline.current
+        if (ratio>1.15 && openness>0.012) {
+          sDone.current=true; passed=true
         }
       }
     }
 
-    if(passed){
+    if (passed) {
       const next=idx+1
       itemsR.current=itemsR.current.map((it,i)=>i===idx?{...it,done:true}:it)
       setItems([...itemsR.current]); idxR.current=next; setActiveI(next); resetAccum()
-      if(next>=itemsR.current.length){
+      if (next>=itemsR.current.length) {
         doneR.current=true; setDone(true); setHint('✅ ¡Perfecto!')
-        setTimeout(()=>captureStill(),800)
+        setTimeout(()=>captureStill(), 800)
       }
     }
   }
 
-  /* ── Load MediaPipe & start camera ───────────────────────────────────── */
+  /* ── Open camera ─────────────────────────────────────────────────────── */
   async function openCamera() {
     setErr(null); setScreen('loading')
-    setLoadMsg('Solicitando permisos de cámara...')
 
-    // 1. get camera permission first
-    let stream: MediaStream|null=null
+    // 1. Get camera stream
+    setLoadMsg('Solicitando permisos de cámara...')
     const tries: MediaStreamConstraints[]=[
       {video:{facingMode:'user',width:{ideal:1280},height:{ideal:720}}},
       {video:{facingMode:'user'}},
       {video:true},
     ]
-    let lastErr: unknown=null
-    for(const c of tries){
-      try{stream=await navigator.mediaDevices.getUserMedia(c);break}
-      catch(e){lastErr=e}
+    let stream:MediaStream|null=null, lastErr:unknown=null
+    for (const c of tries) {
+      try { stream=await navigator.mediaDevices.getUserMedia(c); break }
+      catch (e) { lastErr=e }
     }
-    if(!stream){
+    if (!stream) {
       const n=(lastErr as any)?.name??''
-      const m:Record<string,string>={
-        NotAllowedError:'🚫 Permiso denegado. Haz clic en el ícono de cámara en la barra del navegador.',
-        PermissionDeniedError:'🚫 Permiso denegado. Haz clic en el ícono de cámara en la barra del navegador.',
-        NotFoundError:'📷 No se detectó cámara en este dispositivo.',
-        NotReadableError:'⚠️ La cámara está en uso por otra aplicación.',
-        SecurityError:'🔒 Acceso bloqueado. Abre en localhost o HTTPS.',
+      const msgs:Record<string,string>={
+        NotAllowedError:      '🚫 Permiso denegado. Haz clic en el ícono de cámara en la barra del navegador y permite el acceso.',
+        NotFoundError:        '📷 No se detectó cámara en este dispositivo.',
+        NotReadableError:     '⚠️ La cámara está en uso por otra aplicación o pestaña. Ciérrala e intenta de nuevo.',
+        OverconstrainedError: '⚠️ Resolución no soportada. Intenta con otro navegador.',
+        SecurityError:        '🔒 Acceso bloqueado. Abre en localhost o HTTPS.',
       }
-      setErr(m[n]??`No se pudo acceder a la cámara (${n||'desconocido'}).`)
+      setErr(msgs[n]??`Error de cámara: ${n||'desconocido'}`)
       setScreen('guide'); return
     }
+    // Store stream — will be attached to <video> in useEffect, NOT opened again
     streamRef.current=stream
 
-    // 2. load MediaPipe scripts dynamically
+    // 2. Load MediaPipe scripts
     setLoadMsg('Cargando modelo de detección facial...')
     try {
-      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js')
-      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js')
-      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js')
-    } catch(e) {
-      setErr('No se pudo cargar el modelo de detección. Verifica tu conexión a internet.')
-      stream.getTracks().forEach(t=>t.stop()); streamRef.current=null
-      setScreen('guide'); return
+      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js')
+    } catch {
+      // fallback CDN
+      try {
+        await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js')
+      } catch {
+        setErr('No se pudo cargar el modelo. Verifica tu conexión a internet.')
+        stream.getTracks().forEach(t=>t.stop()); streamRef.current=null
+        setScreen('guide'); return
+      }
     }
 
-    // 3. init FaceMesh
-    setLoadMsg('Iniciando reconocimiento facial...')
-    const FM = (window as any).FaceMesh
-    if(!FM){ setErr('Error cargando FaceMesh.'); setScreen('guide'); return }
+    // 3. Init FaceMesh
+    setLoadMsg('Inicializando reconocimiento facial...')
+    const FM=(window as any).FaceMesh
+    if (!FM) { setErr('Error: FaceMesh no disponible.'); setScreen('guide'); return }
 
-    const faceMesh=new FM({locateFile:(f:string)=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`})
-    faceMesh.setOptions({
+    const mesh=new FM({
+      locateFile:(f:string)=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${f}`
+    })
+    mesh.setOptions({
       maxNumFaces:1,
       refineLandmarks:true,
-      minDetectionConfidence:0.6,
-      minTrackingConfidence:0.6,
+      minDetectionConfidence:0.55,
+      minTrackingConfidence:0.55,
     })
-    faceMesh.onResults((results:any)=>{
-      if(results.multiFaceLandmarks?.length>0){
-        processLandmarks(results.multiFaceLandmarks[0])
-      } else {
-        faceR.current=false; lastLM.current=null
-        setFace(false)
-        if(!doneR.current) setHint('👤 Coloca tu cara dentro del óvalo')
-      }
-    })
-    faceMeshRef.current=faceMesh
+    mesh.onResults(onResults)
 
-    // reset check state
+    // Initialize (downloads WASM model)
+    try {
+      await mesh.initialize()
+    } catch {
+      // initialize() may not exist on all versions — that's fine, send() will init lazily
+    }
+    meshRef.current=mesh
+
+    // Reset state
     itemsR.current=freshItems(); idxR.current=0
     faceR.current=false; doneR.current=false
     setItems(freshItems()); setActiveI(0)
     setFace(false); setHint(''); setDone(false)
     resetAccum()
 
+    // Switch to camera screen → useEffect attaches stream to <video>
     setScreen('camera')
   }
 
-  /* ── Attach video + start loops after camera screen renders ─────────── */
-  useEffect(()=>{
-    if(screen!=='camera') return
-    const v=videoRef.current
-    if(!v||!streamRef.current||!faceMeshRef.current) return
-
-    v.srcObject=streamRef.current
-    v.onloadedmetadata=()=>{
-      v.play().catch(()=>{})
-      runDraw()
-
-      // Use MediaPipe Camera utility to feed frames into FaceMesh
-      const Cam=(window as any).Camera
-      if(Cam){
-        const cam=new Cam(v,{
-          onFrame: async()=>{ await faceMeshRef.current.send({image:v}) },
-          width:640, height:480,
-        })
-        cam.start()
-        cameraRef.current=cam
-      } else {
-        // Fallback: manual rAF loop if Camera util not available
-        const loop=async()=>{
-          if(doneR.current) return
-          if(v.readyState>=2) await faceMeshRef.current.send({image:v})
-          requestAnimationFrame(loop)
-        }
-        requestAnimationFrame(loop)
-      }
-    }
-  },[screen]) // eslint-disable-line
-
   /* ── Capture still ───────────────────────────────────────────────────── */
-  function captureStill(){
+  function captureStill() {
     const v=videoRef.current, c=captureRef.current
-    if(!v||!c) return
+    if (!v||!c) return
     c.width=v.videoWidth||640; c.height=v.videoHeight||480
     const ctx=c.getContext('2d')!
     ctx.save(); ctx.translate(c.width,0); ctx.scale(-1,1)
@@ -407,20 +402,19 @@ export default function SelfieStep() {
   }
 
   /* ── Analyze & proceed ───────────────────────────────────────────────── */
-  async function proceed(){
+  async function proceed() {
     setScreen('analyzing'); setAprogress(0)
-    for(const p of [15,35,55,72,88,95,100]){
+    for (const p of [15,35,55,72,88,95,100]) {
       await new Promise(r=>setTimeout(r,400)); setAprogress(p)
     }
-    if(photo){ setSelfie(photo,Math.floor(Math.random()*10)+90); completeStep('selfie'); setStep('review') }
+    if (photo) { setSelfie(photo,Math.floor(Math.random()*10)+90); completeStep('selfie'); setStep('review') }
   }
 
-  function retake(){ setPhoto(null); setScreen('guide') }
-
-  function handleFile(e:React.ChangeEvent<HTMLInputElement>){
+  function retake() { setPhoto(null); setScreen('guide') }
+  function handleFile(e:React.ChangeEvent<HTMLInputElement>) {
     const f=e.target.files?.[0]; if(!f) return
     const r=new FileReader()
-    r.onloadend=()=>{setPhoto(r.result as string);setScreen('preview')}
+    r.onloadend=()=>{ setPhoto(r.result as string); setScreen('preview') }
     r.readAsDataURL(f)
   }
 
@@ -498,19 +492,20 @@ export default function SelfieStep() {
             <div className="w-20 h-20 rounded-full border-2 border-amber-500/20 flex items-center justify-center">
               <Eye size={32} className="text-amber-500"/>
             </div>
-            <svg className="absolute inset-0 w-full h-full -rotate-90 animate-spin" style={{animationDuration:'1.5s'}} viewBox="0 0 80 80">
-              <circle cx="40" cy="40" r="37" fill="none" stroke="#f59e0b" strokeWidth="3"
-                strokeLinecap="round" strokeDasharray="60 180"/>
+            <svg className="absolute inset-0 w-full h-full -rotate-90" style={{animationDuration:'1.5s'}}
+              viewBox="0 0 80 80">
+              <circle cx="40" cy="40" r="36" fill="none" stroke="#f59e0b" strokeWidth="3"
+                strokeLinecap="round" strokeDasharray="50 175"
+                style={{animation:'spin 1.4s linear infinite'}}/>
             </svg>
           </div>
           <div className="text-center">
             <p className="text-white font-semibold mb-1" style={{fontFamily:'Syne,sans-serif'}}>Preparando verificación</p>
             <p className="text-sm text-zinc-500">{loadMsg}</p>
           </div>
-          <div className="flex flex-col gap-2 text-xs text-zinc-600 text-center max-w-xs">
-            <p>Usando MediaPipe Face Mesh — 468 puntos de referencia faciales</p>
-            <p>La primera vez puede tardar ~5s en descargar el modelo</p>
-          </div>
+          <p className="text-xs text-zinc-600 text-center max-w-xs">
+            Modelo MediaPipe Face Mesh — 468 puntos de referencia faciales en tiempo real
+          </p>
         </div>
       )}
 
@@ -518,11 +513,12 @@ export default function SelfieStep() {
       {screen==='camera'&&(
         <div className="space-y-4">
           <div className="relative rounded-2xl overflow-hidden bg-black aspect-[4/3]">
+            {/* Video — CSS mirror only, stream already open, NOT re-opened */}
             <video ref={videoRef} autoPlay playsInline muted
               className="absolute inset-0 w-full h-full object-cover"
               style={{transform:'scaleX(-1)'}}/>
-            <canvas ref={overlayRef}
-              className="absolute inset-0 w-full h-full pointer-events-none"/>
+            {/* Oval overlay */}
+            <canvas ref={overlayRef} className="absolute inset-0 w-full h-full pointer-events-none"/>
 
             {/* Face badge */}
             <div className={clsx(
@@ -535,7 +531,7 @@ export default function SelfieStep() {
               </span>
             </div>
 
-            {/* Hint */}
+            {/* Instruction hint */}
             {hint&&!done&&(
               <div className="absolute bottom-4 left-0 right-0 flex justify-center px-4">
                 <div className="bg-black/80 backdrop-blur-sm px-4 py-2.5 rounded-full border border-white/10">
@@ -552,7 +548,6 @@ export default function SelfieStep() {
             )}
           </div>
 
-          {/* Hidden capture canvas */}
           <canvas ref={captureRef} className="hidden"/>
 
           {/* Checklist */}
@@ -647,16 +642,4 @@ export default function SelfieStep() {
 
     </div>
   )
-}
-
-/* ─── Helper: load external script ──────────────────────────────────────── */
-function loadScript(src: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return }
-    const s = document.createElement('script')
-    s.src = src; s.crossOrigin = 'anonymous'
-    s.onload  = () => resolve()
-    s.onerror = () => reject(new Error(`Failed to load ${src}`))
-    document.head.appendChild(s)
-  })
 }
